@@ -178,25 +178,36 @@ class QALDDataset:
 
 def load_qald(path: str | Path, encoding: str = "utf-8") -> QALDDataset:
     """
-    Parse a QALD-6/7 JSON file.
+    Parse a real QALD-6 / QALD-7 multilingual JSON file.
 
-    QALD JSON structure (simplified):
+    Actual file structure (ag-sc/QALD on GitHub):
     {
+      "dataset": {"id": "qald-7-train-multilingual"},
       "questions": [
         {
           "id": "1",
-          "question": [{"language": "en", "string": "..."}],
-          "answers": [{"results": {"bindings": [{"uri": {"value": "..."}}]}}]
-          "triples": [  ← optional temporal annotation
-            {"subject": "...", "predicate": "...", "object": "...",
-             "time_start": 2004, "time_end": 2021}
+          "answertype": "resource",
+          "question": [
+            {"language": "en", "string": "Who is the ...", "keywords": "..."}
+          ],
+          "query": {"sparql": "SELECT DISTINCT ?uri WHERE { ... }"},
+          "answers": [
+            {
+              "head": {"vars": ["uri"]},
+              "results": {
+                "bindings": [
+                  {"uri": {"type": "uri", "value": "http://dbpedia.org/resource/..."}}
+                ]
+              }
+            }
           ]
         }
       ]
     }
 
-    For questions without explicit triple annotations, the function
-    inserts a placeholder triple using the question id as the subject.
+    Entities mentioned in answers are registered in the TKGDataset vocabulary.
+    Triple-level temporal annotations are not present in QALD files; the SPARQL
+    query string is stored for reference but not executed here.
     """
     ds        = TKGDataset()
     questions = []
@@ -207,40 +218,98 @@ def load_qald(path: str | Path, encoding: str = "utf-8") -> QALDDataset:
     for q in data.get("questions", []):
         qid = str(q.get("id", ""))
 
-        # --- extract English question string ---
+        # --- English question string ---
         qtext = ""
         for lang_entry in q.get("question", []):
             if lang_entry.get("language") == "en":
                 qtext = lang_entry.get("string", "")
                 break
 
-        # --- extract answer URIs ---
+        # --- SPARQL query string (stored for reference) ---
+        sparql = q.get("query", {}).get("sparql", "")
+
+        # --- answer URIs ---
         answers: set[str] = set()
         for answer_block in q.get("answers", []):
             for binding in answer_block.get("results", {}).get("bindings", []):
-                for key, val in binding.items():
+                for val in binding.values():
                     uri = val.get("value", "")
-                    if uri:
+                    if uri and val.get("type") in ("uri", "typed-literal", None):
                         answers.add(_local_name(uri))
 
-        # --- extract triple annotations ---
-        for triple in q.get("triples", []):
-            subj = triple.get("subject",   qid)
-            pred = triple.get("predicate", "relatedTo")
-            obj  = triple.get("object",    "unknown")
-            ts   = triple.get("time_start")
-            te   = triple.get("time_end")
-            if triple.get("type") == "attribute":
-                ds.add_attribute_triple(subj, pred, obj)
-            else:
-                ds.add_relation_triple(subj, pred, obj,
-                                       time_start=ts, time_end=te)
-
-        # register answer entities so they appear in the vocabulary
+        # register answer entities in the vocabulary
         for ans in answers:
             ds.add_entity(ans)
 
-        questions.append({"id": qid, "question": qtext, "answers": answers})
+        questions.append({
+            "id":       qid,
+            "question": qtext,
+            "sparql":   sparql,
+            "answers":  answers,
+        })
+
+    ds.build_indices()
+    return QALDDataset(ds, questions)
+
+
+def load_lcquad(path: str | Path, encoding: str = "utf-8") -> QALDDataset:
+    """
+    Parse an LC-QuAD 1.0 JSON file (AskNowQA/LC-QuAD on GitHub).
+
+    Actual file structure (train.json / test.json):
+    [
+      {
+        "_id": "1",
+        "corrected_question": "What is the ...",
+        "sparql_query": "SELECT DISTINCT ?uri WHERE { ... }",
+        "sparql_template_id": 1,
+        "subgraph": "...",
+        "entities": ["http://dbpedia.org/resource/..."],
+        "relations": ["http://dbpedia.org/ontology/..."],
+        "answer": [
+          {"type": "uri", "value": "http://dbpedia.org/resource/..."}
+        ]
+      },
+      ...
+    ]
+
+    Answer URIs are resolved to local names and registered as entities.
+    Entity/relation URIs from the question annotations are added to the TKG
+    vocabulary (without triples — the TKG structure is supplied separately
+    from a DBpedia dump loaded via load_ntriples or load_tsv).
+    """
+    ds        = TKGDataset()
+    questions = []
+
+    with Path(path).open(encoding=encoding) as f:
+        data = json.load(f)
+
+    for q in data:
+        qid   = str(q.get("_id", q.get("id", "")))
+        qtext = q.get("corrected_question", q.get("question", ""))
+        sparql = q.get("sparql_query", "")
+
+        # --- answer URIs ---
+        answers: set[str] = set()
+        for ans_entry in q.get("answer", []):
+            uri = ans_entry.get("value", "")
+            if uri:
+                answers.add(_local_name(uri))
+
+        # --- register entities and relations from annotations ---
+        for uri in q.get("entities", []):
+            ds.add_entity(_local_name(uri))
+        for uri in q.get("relations", []):
+            ds.add_relation(_local_name(uri))
+        for ans in answers:
+            ds.add_entity(ans)
+
+        questions.append({
+            "id":       qid,
+            "question": qtext,
+            "sparql":   sparql,
+            "answers":  answers,
+        })
 
     ds.build_indices()
     return QALDDataset(ds, questions)

@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import pytest
 
-from src.data.loaders import load_tsv, load_ntriples, load_qald, QALDDataset
+from src.data.loaders import load_tsv, load_ntriples, load_qald, load_lcquad, QALDDataset
 from src.training.trainer import TLAQTrainer, TrainConfig
 
 
@@ -145,36 +145,34 @@ class TestLoadNTriples:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ③ QALD loader
+# ③ QALD loader  (real QALD-6/7 format)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Mirrors the actual ag-sc/QALD multilingual JSON structure
 QALD_JSON = {
+    "dataset": {"id": "qald-7-train-multilingual"},
     "questions": [
         {
             "id": "1",
-            "question": [{"language": "en", "string": "Who plays for FCBarcelona?"}],
-            "answers": [{"results": {"bindings": [
-                {"uri": {"value": "http://example.org/Messi"}},
-                {"uri": {"value": "http://example.org/Suarez"}},
+            "answertype": "resource",
+            "question": [{"language": "en", "string": "Who plays for FCBarcelona?",
+                          "keywords": "FCBarcelona, plays for"}],
+            "query": {"sparql": "SELECT DISTINCT ?uri WHERE { ?uri dbo:team dbr:FC_Barcelona }"},
+            "answers": [{"head": {"vars": ["uri"]}, "results": {"bindings": [
+                {"uri": {"type": "uri", "value": "http://dbpedia.org/resource/Messi"}},
+                {"uri": {"type": "uri", "value": "http://dbpedia.org/resource/Suarez"}},
             ]}}],
-            "triples": [
-                {"subject": "Messi",  "predicate": "playFor",
-                 "object": "FCBarcelona", "time_start": 2004, "time_end": 2021},
-                {"subject": "Suarez", "predicate": "serves",
-                 "object": "FCBarcelona", "time_start": 2014, "time_end": 2020},
-            ]
         },
         {
             "id": "2",
-            "question": [{"language": "en", "string": "Where was Messi born?"}],
-            "answers": [{"results": {"bindings": [
-                {"uri": {"value": "http://example.org/Argentina"}}
+            "answertype": "resource",
+            "question": [{"language": "en", "string": "Where was Messi born?",
+                          "keywords": "Messi, born"}],
+            "query": {"sparql": "SELECT DISTINCT ?uri WHERE { dbr:Messi dbo:birthPlace ?uri }"},
+            "answers": [{"head": {"vars": ["uri"]}, "results": {"bindings": [
+                {"uri": {"type": "uri", "value": "http://dbpedia.org/resource/Argentina"}}
             ]}}],
-            "triples": [
-                {"subject": "Messi", "predicate": "bornIn",
-                 "object": "Argentina", "type": "attribute"}
-            ]
-        }
+        },
     ]
 }
 
@@ -195,31 +193,110 @@ class TestLoadQALD:
         qs = load_qald(qald_path)
         assert len(qs) == 2
 
-    def test_relation_triples_loaded(self, qald_path):
-        qs = load_qald(qald_path)
-        assert len(qs.tkg.relation_triples) >= 2
-
-    def test_attribute_triple_loaded(self, qald_path):
-        qs = load_qald(qald_path)
-        assert len(qs.tkg.attribute_triples) >= 1
-
     def test_answer_entities_in_vocab(self, qald_path):
         qs = load_qald(qald_path)
-        answers = qs.questions[0]["answers"]
-        for ans in answers:
+        for ans in qs.questions[0]["answers"]:
             assert ans in qs.tkg.entity2id, f"{ans} not in entity vocab"
 
     def test_answer_entity_ids(self, qald_path):
         qs = load_qald(qald_path)
         ids = qs.answer_entity_ids(0)
         assert isinstance(ids, set)
-        assert len(ids) >= 1   # at least one answer resolved
+        assert len(ids) >= 1
 
-    def test_time_stored(self, qald_path):
+    def test_sparql_stored(self, qald_path):
         qs = load_qald(qald_path)
-        messi_id = qs.tkg.entity2id.get("Messi")
-        triples = [t for t in qs.tkg.relation_triples if t.head == messi_id]
-        assert any(t.time_start == 2004 for t in triples)
+        assert "SELECT" in qs.questions[0]["sparql"]
+
+    def test_local_name_resolution(self, qald_path):
+        """DBpedia URIs should be shortened to local names (e.g. 'Messi')."""
+        qs = load_qald(qald_path)
+        assert "Messi" in qs.tkg.entity2id
+
+    def test_multi_answer_question(self, qald_path):
+        """Question 1 has two answers."""
+        qs = load_qald(qald_path)
+        assert len(qs.questions[0]["answers"]) == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ④ LC-QuAD 1.0 loader
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Mirrors the actual AskNowQA/LC-QuAD train.json / test.json structure
+LCQUAD_JSON = [
+    {
+        "_id": "1",
+        "corrected_question": "What is the birth place of Messi?",
+        "sparql_query": "SELECT DISTINCT ?uri WHERE { dbr:Messi dbo:birthPlace ?uri }",
+        "sparql_template_id": 1,
+        "subgraph": "dbo:birthPlace",
+        "entities":  ["http://dbpedia.org/resource/Messi"],
+        "relations": ["http://dbpedia.org/ontology/birthPlace"],
+        "answer": [
+            {"type": "uri", "value": "http://dbpedia.org/resource/Argentina"}
+        ]
+    },
+    {
+        "_id": "2",
+        "corrected_question": "Which team does Neymar play for?",
+        "sparql_query": "SELECT DISTINCT ?uri WHERE { dbr:Neymar dbo:team ?uri }",
+        "sparql_template_id": 2,
+        "subgraph": "dbo:team",
+        "entities":  ["http://dbpedia.org/resource/Neymar"],
+        "relations": ["http://dbpedia.org/ontology/team"],
+        "answer": [
+            {"type": "uri", "value": "http://dbpedia.org/resource/PSG"}
+        ]
+    },
+]
+
+
+class TestLoadLCQuAD:
+
+    @pytest.fixture
+    def lcquad_path(self, tmp_path):
+        p = tmp_path / "train.json"
+        p.write_text(json.dumps(LCQUAD_JSON), encoding="utf-8")
+        return p
+
+    def test_returns_qald_dataset(self, lcquad_path):
+        qs = load_lcquad(lcquad_path)
+        assert isinstance(qs, QALDDataset)
+
+    def test_question_count(self, lcquad_path):
+        qs = load_lcquad(lcquad_path)
+        assert len(qs) == 2
+
+    def test_answer_entities_in_vocab(self, lcquad_path):
+        qs = load_lcquad(lcquad_path)
+        for ans in qs.questions[0]["answers"]:
+            assert ans in qs.tkg.entity2id, f"{ans} not in entity vocab"
+
+    def test_answer_entity_ids(self, lcquad_path):
+        qs = load_lcquad(lcquad_path)
+        ids = qs.answer_entity_ids(0)
+        assert isinstance(ids, set)
+        assert len(ids) == 1   # Argentina
+
+    def test_entity_annotations_registered(self, lcquad_path):
+        """Entities from 'entities' list should be in vocab."""
+        qs = load_lcquad(lcquad_path)
+        assert "Messi" in qs.tkg.entity2id
+
+    def test_relation_annotations_registered(self, lcquad_path):
+        """Relations from 'relations' list should be in vocab."""
+        qs = load_lcquad(lcquad_path)
+        assert "birthPlace" in qs.tkg.relation2id
+
+    def test_sparql_stored(self, lcquad_path):
+        qs = load_lcquad(lcquad_path)
+        assert "SELECT" in qs.questions[0]["sparql"]
+
+    def test_local_name_resolution(self, lcquad_path):
+        """DBpedia URIs should resolve to local names."""
+        qs = load_lcquad(lcquad_path)
+        assert "Argentina" in qs.tkg.entity2id
 
 
 # ═══════════════════════════════════════════════════════════════════════════
