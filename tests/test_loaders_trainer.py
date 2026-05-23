@@ -2,14 +2,14 @@
 Tests for data loaders (src/data/loaders.py) and
 training orchestrator (src/training/trainer.py).
 """
-import sys, os, json, textwrap, tempfile
+import sys, os, json, textwrap, tempfile, bz2
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pathlib import Path
 import torch
 import pytest
 
-from src.data.loaders import load_tsv, load_ntriples, load_qald, load_lcquad, QALDDataset
+from src.data.loaders import load_tsv, load_ntriples, load_turtle, load_qald, load_lcquad, QALDDataset
 from src.training.trainer import TLAQTrainer, TrainConfig
 
 
@@ -145,7 +145,80 @@ class TestLoadNTriples:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ③ QALD loader  (real QALD-6/7 format)
+# ③ Turtle loader  (DBpedia .ttl / .ttl.bz2)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestLoadTurtle:
+
+    TTL_BASIC = """\
+        @prefix dbo: <http://dbpedia.org/ontology/> .
+        @prefix dbr: <http://dbpedia.org/resource/> .
+
+        dbr:Messi  dbo:team      dbr:FC_Barcelona .
+        dbr:Neymar dbo:team      dbr:PSG .
+        dbr:Messi  dbo:birthDate "1987-06-24"^^<http://www.w3.org/2001/XMLSchema#date> .
+        dbr:Messi  dbo:birthPlace dbr:Argentina .
+    """
+    TTL_LITERAL = """\
+        @prefix dbo: <http://dbpedia.org/ontology/> .
+        @prefix dbr: <http://dbpedia.org/resource/> .
+
+        dbr:Messi dbo:abstract "Lionel Messi is an Argentine footballer."@en .
+    """
+
+    def test_entities_loaded(self, tmp_path):
+        p = tmp_path / "test.ttl"
+        p.write_text(textwrap.dedent(self.TTL_BASIC), encoding="utf-8")
+        ds = load_turtle(p)
+        assert "Messi" in ds.entity2id
+        assert "FC_Barcelona" in ds.entity2id
+
+    def test_relation_loaded(self, tmp_path):
+        p = tmp_path / "test.ttl"
+        p.write_text(textwrap.dedent(self.TTL_BASIC), encoding="utf-8")
+        ds = load_turtle(p)
+        assert "team" in ds.relation2id
+
+    def test_date_literal_as_time(self, tmp_path):
+        p = tmp_path / "test.ttl"
+        p.write_text(textwrap.dedent(self.TTL_BASIC), encoding="utf-8")
+        ds = load_turtle(p)
+        messi_id = ds.entity2id.get("Messi")
+        time_triples = [t for t in ds.relation_triples
+                        if t.head == messi_id and t.time_start is not None]
+        assert any(t.time_start == 1987 for t in time_triples)
+
+    def test_string_literal_as_attribute(self, tmp_path):
+        p = tmp_path / "test.ttl"
+        p.write_text(textwrap.dedent(self.TTL_LITERAL), encoding="utf-8")
+        ds = load_turtle(p)
+        assert len(ds.attribute_triples) >= 1
+
+    def test_bz2_compressed(self, tmp_path):
+        content = textwrap.dedent(self.TTL_BASIC).encode("utf-8")
+        p = tmp_path / "test.ttl.bz2"
+        with bz2.open(p, "wb") as f:
+            f.write(content)
+        ds = load_turtle(p)
+        assert ds.num_entities >= 3
+
+    def test_limit(self, tmp_path):
+        p = tmp_path / "test.ttl"
+        p.write_text(textwrap.dedent(self.TTL_BASIC), encoding="utf-8")
+        ds = load_turtle(p, limit=2)
+        total = len(ds.relation_triples) + len(ds.attribute_triples)
+        assert total <= 2
+
+    def test_indices_built(self, tmp_path):
+        p = tmp_path / "test.ttl"
+        p.write_text(textwrap.dedent(self.TTL_BASIC), encoding="utf-8")
+        ds = load_turtle(p)
+        assert ds.num_entities > 0
+        assert ds._indices_built
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ④ QALD loader  (real QALD-6/7 format)
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Mirrors the actual ag-sc/QALD multilingual JSON structure

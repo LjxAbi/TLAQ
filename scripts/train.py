@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-from src.data.loaders import load_tsv, load_qald
+from src.data.loaders import load_tsv, load_turtle, load_qald, load_lcquad
 from src.training.trainer import TLAQTrainer, TrainConfig
 
 
@@ -50,8 +50,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test",      default=None,
                    help="Path to a separate test split (TSV only). "
                         "If omitted, evaluation is skipped.")
-    p.add_argument("--format",    choices=["tsv", "qald"], default="tsv",
-                   help="Dataset file format (default: tsv).")
+    p.add_argument("--format",
+                   choices=["tsv", "turtle", "ttl", "qald", "lcquad"],
+                   default="tsv",
+                   help="Dataset file format (default: tsv). "
+                        "Use 'turtle'/'ttl' for DBpedia .ttl/.ttl.bz2 files.")
     p.add_argument("--embed-dim", type=int,   default=128)
     p.add_argument("--gcn-epochs",type=int,   default=100)
     p.add_argument("--hyte-epochs",type=int,  default=100)
@@ -83,9 +86,12 @@ def main() -> None:
     print(f"Loading dataset: {args.data}  (format={args.format})")
     if args.format == "tsv":
         dataset = load_tsv(args.data)
-    else:
-        qald_ds = load_qald(args.data)
-        dataset = qald_ds.tkg
+    elif args.format in ("turtle", "ttl"):
+        dataset = load_turtle(args.data)
+    elif args.format == "lcquad":
+        dataset = load_lcquad(args.data).tkg
+    else:  # qald
+        dataset = load_qald(args.data).tkg
 
     print(f"  entities={dataset.num_entities}  "
           f"relations={dataset.num_relations}  "

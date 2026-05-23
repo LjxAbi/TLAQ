@@ -4,34 +4,27 @@ TKG dataset loaders for TLAQ benchmarks.
 Supported formats
 -----------------
 load_tsv(path)
-    Tab-separated triples.  Two variants are auto-detected:
+    Tab-separated triples (3/4/5 columns, optional time fields).
 
-    4-column  head  relation  tail  year
-    5-column  head  relation  tail  year_start  year_end
-
-    Example (ICEWS-style):
-        Barack_Obama  visited  Germany  2009
-        Merkel        leads    CDU      1998  2018
+load_turtle(path)
+    DBpedia Turtle (.ttl) or compressed (.ttl.bz2) via rdflib.
+    Handles @prefix declarations automatically.
+    Supports streaming bzip2 decompression — no manual unzip needed.
 
 load_ntriples(path)
-    W3C N-Triples (.nt) with optional temporal annotations stored as
-    xsd:gYear literals on the object position.
-
-    <subject> <predicate> <object> .
-    <subject> <predicate> "2004"^^<xsd:gYear> .
+    W3C N-Triples (.nt) — lightweight regex parser for simple files.
 
 load_qald(path)
-    QALD-6 / QALD-7 JSON format (questions + SPARQL answers).
-    Extracts the answer entities from each question's SPARQL result and
-    returns (question_id, answer_entity_list) pairs.
+    QALD-6 / QALD-7 multilingual JSON format.
 
-    The returned QALDDataset contains both the raw TKG triples (built
-    from the question annotations) and the QA pairs for evaluation.
+load_lcquad(path)
+    LC-QuAD 1.0 JSON format (AskNowQA/LC-QuAD).
 
-All loaders return a TKGDataset with build_indices() already called.
+All loaders return a TKGDataset (or QALDDataset) with build_indices() called.
 """
 from __future__ import annotations
 
+import bz2
 import csv
 import json
 import re
@@ -140,6 +133,91 @@ def load_ntriples(
                 literal = obj.strip('"').split('"')[0]
                 ds.add_attribute_triple(subj, pred, literal)
 
+    ds.build_indices()
+    return ds
+
+
+# ---------------------------------------------------------------------------
+# Turtle loader  (DBpedia .ttl / .ttl.bz2)
+# ---------------------------------------------------------------------------
+
+def load_turtle(
+    path: str | Path,
+    limit: Optional[int] = None,
+    progress_every: int = 1_000_000,
+) -> TKGDataset:
+    """
+    Load a DBpedia Turtle file (.ttl or .ttl.bz2) into a TKGDataset.
+
+    Uses rdflib for correct Turtle parsing (handles @prefix, semicolons,
+    blank nodes, etc.).  bzip2 files are streamed without full decompression.
+
+    Parameters
+    ----------
+    path           : path to .ttl or .ttl.bz2 file
+    limit          : stop after this many triples (useful for testing)
+    progress_every : print a progress line every N triples
+
+    Notes
+    -----
+    - URI objects  → relation triple  (subject, predicate, object)
+    - xsd:gYear / xsd:date literals → stored as time_start on the triple
+    - Other literals → attribute triple  (subject, predicate, literal_value)
+    - rdflib required: pip install rdflib
+    """
+    try:
+        import rdflib
+        from rdflib import URIRef, Literal
+        from rdflib.namespace import XSD
+    except ImportError:
+        raise ImportError(
+            "rdflib is required for Turtle loading: pip install rdflib"
+        )
+
+    path = Path(path)
+    ds   = TKGDataset()
+
+    # streaming parse: rdflib can parse from a file-like object
+    if path.suffix == ".bz2":
+        fh = bz2.open(path, "rt", encoding="utf-8", errors="replace")
+    else:
+        fh = path.open("r", encoding="utf-8", errors="replace")
+
+    g = rdflib.Graph()
+    try:
+        g.parse(fh, format="turtle")
+    finally:
+        fh.close()
+
+    count = 0
+    for subj, pred, obj in g:
+        if not isinstance(subj, URIRef):
+            continue   # skip blank-node subjects
+
+        s = _local_name(str(subj))
+        p = _local_name(str(pred))
+
+        if isinstance(obj, URIRef):
+            ds.add_relation_triple(s, p, _local_name(str(obj)))
+        elif isinstance(obj, Literal):
+            dt  = str(obj.datatype) if obj.datatype else ""
+            val = str(obj)
+            if "gYear" in dt or "date" in dt:
+                year = _parse_year(val[:4])
+                ds.add_relation_triple(s, p, s, time_start=year)
+            else:
+                ds.add_attribute_triple(s, p, val[:256])  # cap long literals
+        else:
+            continue  # skip blank-node objects
+
+        count += 1
+        if progress_every and count % progress_every == 0:
+            print(f"  [load_turtle] {count:,} triples loaded…")
+        if limit and count >= limit:
+            break
+
+    print(f"  [load_turtle] done — {count:,} triples, "
+          f"{ds.num_entities:,} entities, {ds.num_relations:,} relations")
     ds.build_indices()
     return ds
 
