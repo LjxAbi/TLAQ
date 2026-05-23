@@ -96,19 +96,31 @@ _URI_PATTERN  = re.compile(r'<([^>]+)>')
 def load_ntriples(
     path: str | Path,
     encoding: str = "utf-8",
+    limit: Optional[int] = None,
+    progress_every: int = 500_000,
 ) -> TKGDataset:
     """
-    Load a TKG from a W3C N-Triples (.nt) file.
+    Load a TKG from a W3C N-Triples (.nt) or N-Triples-in-Turtle (.ttl / .ttl.bz2)
+    file.  Supports bzip2 compression transparently.
 
-    URIs are shortened to their local name (fragment or last path segment)
-    to keep entity/relation labels readable.  Literal objects that are
-    xsd:gYear values are stored as time_start.  All other literal objects
-    are treated as attribute values.
+    DBpedia's mappingbased-objects_lang=en.ttl.bz2 and
+    mappingbased-literals_lang=en.ttl.bz2 are actually N-Triples format
+    despite the .ttl extension, so this loader handles them directly.
+
+    Parameters
+    ----------
+    limit          : stop after this many triples (useful for testing/subsets)
+    progress_every : print a progress line every N triples
     """
-    ds   = TKGDataset()
-    path = Path(path)
+    ds    = TKGDataset()
+    path  = Path(path)
+    count = 0
 
-    with path.open(encoding=encoding) as f:
+    opener = (bz2.open(path, "rt", encoding=encoding, errors="replace")
+              if str(path).endswith(".bz2")
+              else path.open(encoding=encoding, errors="replace"))
+
+    with opener as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -122,17 +134,25 @@ def load_ntriples(
 
             year_m = _LITERAL_YEAR.match(obj)
             if year_m:
-                ds.add_relation_triple(subj, pred, subj,  # self-loop as timestamp stub
+                ds.add_relation_triple(subj, pred, subj,
                                        time_start=int(year_m.group(1)))
             elif obj.startswith("<"):
                 uri_m = _URI_PATTERN.match(obj)
                 if uri_m:
                     ds.add_relation_triple(subj, pred, _local_name(uri_m.group(1)))
             else:
-                # plain literal → attribute triple
                 literal = obj.strip('"').split('"')[0]
                 ds.add_attribute_triple(subj, pred, literal)
 
+            count += 1
+            if progress_every and count % progress_every == 0:
+                print(f"  [load_ntriples] {count:,} triples…")
+            if limit and count >= limit:
+                break
+
+    if progress_every:
+        print(f"  [load_ntriples] done — {count:,} triples, "
+              f"{ds.num_entities:,} entities, {ds.num_relations:,} relations")
     ds.build_indices()
     return ds
 
@@ -144,79 +164,87 @@ def load_ntriples(
 def load_turtle(
     path: str | Path,
     limit: Optional[int] = None,
-    progress_every: int = 1_000_000,
+    progress_every: int = 500_000,
 ) -> TKGDataset:
     """
-    Load a DBpedia Turtle file (.ttl or .ttl.bz2) into a TKGDataset.
+    Load a DBpedia .ttl or .ttl.bz2 file.
 
-    Uses rdflib for correct Turtle parsing (handles @prefix, semicolons,
-    blank nodes, etc.).  bzip2 files are streamed without full decompression.
+    DBpedia files (mappingbased-objects, mappingbased-literals) are actually
+    N-Triples format despite the .ttl extension — one full URI triple per line,
+    no @prefix declarations.  This function detects that and delegates to the
+    fast streaming load_ntriples loader.
 
-    Parameters
-    ----------
-    path           : path to .ttl or .ttl.bz2 file
-    limit          : stop after this many triples (useful for testing)
-    progress_every : print a progress line every N triples
-
-    Notes
-    -----
-    - URI objects  → relation triple  (subject, predicate, object)
-    - xsd:gYear / xsd:date literals → stored as time_start on the triple
-    - Other literals → attribute triple  (subject, predicate, literal_value)
-    - rdflib required: pip install rdflib
+    If the file contains @prefix declarations (true Turtle), rdflib is used.
+    For very large true-Turtle files, prefer converting to N-Triples first.
     """
+    path = Path(path)
+
+    # Peek at first non-empty line to detect format
+    opener = (bz2.open(path, "rt", encoding="utf-8", errors="replace")
+              if str(path).endswith(".bz2")
+              else path.open("r", encoding="utf-8", errors="replace"))
+    first_line = ""
+    with opener as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                first_line = stripped
+                break
+
+    # If first line is a full URI triple, it's N-Triples (delegate)
+    if first_line.startswith("<"):
+        return load_ntriples(path, limit=limit, progress_every=progress_every)
+
+    # True Turtle with @prefix — use rdflib (only practical for small files)
     try:
         import rdflib
-        from rdflib import URIRef, Literal
-        from rdflib.namespace import XSD
+        from rdflib import URIRef, Literal, Graph
     except ImportError:
-        raise ImportError(
-            "rdflib is required for Turtle loading: pip install rdflib"
-        )
+        raise ImportError("rdflib is required for true-Turtle files: pip install rdflib")
 
-    path = Path(path)
-    ds   = TKGDataset()
+    ds    = TKGDataset()
+    count = [0]
 
-    # streaming parse: rdflib can parse from a file-like object
-    if path.suffix == ".bz2":
-        fh = bz2.open(path, "rt", encoding="utf-8", errors="replace")
-    else:
-        fh = path.open("r", encoding="utf-8", errors="replace")
+    class _LimitReached(Exception):
+        pass
 
-    g = rdflib.Graph()
-    try:
-        g.parse(fh, format="turtle")
-    finally:
-        fh.close()
-
-    count = 0
-    for subj, pred, obj in g:
+    def _add(subj, pred, obj):
         if not isinstance(subj, URIRef):
-            continue   # skip blank-node subjects
-
+            return
         s = _local_name(str(subj))
         p = _local_name(str(pred))
-
         if isinstance(obj, URIRef):
             ds.add_relation_triple(s, p, _local_name(str(obj)))
         elif isinstance(obj, Literal):
-            dt  = str(obj.datatype) if obj.datatype else ""
+            dt = str(obj.datatype) if obj.datatype else ""
             val = str(obj)
             if "gYear" in dt or "date" in dt:
-                year = _parse_year(val[:4])
-                ds.add_relation_triple(s, p, s, time_start=year)
+                ds.add_relation_triple(s, p, s, time_start=_parse_year(val[:4]))
             else:
-                ds.add_attribute_triple(s, p, val[:256])  # cap long literals
+                ds.add_attribute_triple(s, p, val[:256])
         else:
-            continue  # skip blank-node objects
+            return
+        count[0] += 1
+        if progress_every and count[0] % progress_every == 0:
+            print(f"  [load_turtle] {count[0]:,} triples…")
+        if limit and count[0] >= limit:
+            raise _LimitReached()
 
-        count += 1
-        if progress_every and count % progress_every == 0:
-            print(f"  [load_turtle] {count:,} triples loaded…")
-        if limit and count >= limit:
-            break
+    class _SinkGraph(Graph):
+        def add(self, triple):
+            _add(*triple)
 
-    print(f"  [load_turtle] done — {count:,} triples, "
+    fh = (bz2.open(path, "rt", encoding="utf-8", errors="replace")
+          if str(path).endswith(".bz2")
+          else path.open("r", encoding="utf-8", errors="replace"))
+    try:
+        _SinkGraph().parse(fh, format="turtle")
+    except _LimitReached:
+        pass
+    finally:
+        fh.close()
+
+    print(f"  [load_turtle] done — {count[0]:,} triples, "
           f"{ds.num_entities:,} entities, {ds.num_relations:,} relations")
     ds.build_indices()
     return ds
