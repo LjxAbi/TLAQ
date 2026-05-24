@@ -188,6 +188,98 @@ def targeted_scan(
 
 
 # ---------------------------------------------------------------------------
+# DBpedia SPARQL fetch (alternative to local bz2 scan)
+# ---------------------------------------------------------------------------
+
+def sparql_fetch(
+    anchor_set: set[str],
+    endpoint: str = "https://dbpedia.org/sparql",
+    per_entity_limit: int = 2000,
+    delay: float = 1.0,
+) -> list[tuple[str, str, str, Optional[int]]]:
+    """
+    Query the DBpedia SPARQL endpoint for all triples involving each anchor
+    entity (as subject or object).  No local files needed.
+
+    Returns list of (subj_local, pred_local, obj_local, year_or_None).
+    """
+    import urllib.request
+    import urllib.parse
+
+    triples: list[tuple[str, str, str, Optional[int]]] = []
+    seen: set[tuple[str, str, str]] = set()
+    failed = 0
+
+    anchors = sorted(anchor_set)
+    for i, entity in enumerate(anchors):
+        uri = f"http://dbpedia.org/resource/{entity}"
+        query = (
+            f"SELECT ?s ?p ?o WHERE {{"
+            f"  {{ <{uri}> ?p ?o }} UNION {{ ?s ?p <{uri}> }}"
+            f"}} LIMIT {per_entity_limit}"
+        )
+        params = urllib.parse.urlencode({
+            "query":  query,
+            "format": "application/sparql-results+json",
+        })
+        url = f"{endpoint}?{params}"
+        try:
+            req = urllib.request.Request(
+                url, headers={"Accept": "application/sparql-results+json",
+                              "User-Agent": "TLAQ-research/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+
+            for binding in data.get("results", {}).get("bindings", []):
+                p_b = binding.get("p", {})
+                o_b = binding.get("o", {})
+                s_b = binding.get("s", {})
+                if not p_b or not o_b:
+                    continue
+
+                subj = _local(s_b.get("value", "")) if s_b else entity
+                pred = _local(p_b.get("value", ""))
+                o_type   = o_b.get("type", "")
+                o_val    = o_b.get("value", "")
+                o_dtype  = o_b.get("datatype", "")
+
+                year: Optional[int] = None
+                if o_type == "uri":
+                    obj: Optional[str] = _local(o_val)
+                elif "gYear" in o_dtype:
+                    try:
+                        year = int(o_val[:4])
+                    except ValueError:
+                        year = None
+                    obj = subj
+                else:
+                    obj = o_val.strip()
+
+                if not obj or not pred or not subj:
+                    continue
+
+                key = (subj, pred, obj)
+                if key not in seen:
+                    seen.add(key)
+                    triples.append((subj, pred, obj, year))
+
+        except Exception as exc:
+            failed += 1
+            print(f"  [warn] {entity}: {exc}")
+            time.sleep(delay * 2)
+            continue
+
+        if (i + 1) % 20 == 0 or (i + 1) == len(anchors):
+            print(f"  {i+1}/{len(anchors)} entities fetched — "
+                  f"{len(triples):,} triples so far")
+        time.sleep(delay)
+
+    print(f"  Done. {len(triples):,} triples, {failed} entities failed.")
+    return triples
+
+
+# ---------------------------------------------------------------------------
 # TKG builder
 # ---------------------------------------------------------------------------
 
@@ -311,6 +403,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run-name",    default=None)
     p.add_argument("--no-inverse",  action="store_true",
                    help="Do not add inverse relations (reverse queries become no-ops).")
+    p.add_argument("--use-sparql", action="store_true",
+                   help="Fetch triples from DBpedia SPARQL instead of local bz2 files.")
+    p.add_argument("--sparql-endpoint", default="https://dbpedia.org/sparql",
+                   help="SPARQL endpoint URL (default: DBpedia public endpoint).")
+    p.add_argument("--sparql-limit", type=int, default=2000,
+                   help="Max triples per entity from SPARQL (default 2000).")
     return p.parse_args()
 
 
@@ -328,25 +426,37 @@ def main() -> None:
     questions, anchor_set = load_qald_eval(args.qald)
     print(f"  {len(questions)} questions, {len(anchor_set)} unique anchor entities")
 
-    # ── 2. Targeted DBpedia scan ──────────────────────────────────────────
+    # ── 2. Load DBpedia triples ───────────────────────────────────────────
     raw_triples: list[tuple] = []
-    for fpath in (args.dbpedia_objects, args.dbpedia_literals):
-        if not Path(fpath).exists():
-            print(f"  [skip] {fpath} not found")
-            continue
-        print(f"\nStep 2 — Scanning {Path(fpath).name}")
+
+    if args.use_sparql:
+        print("\nStep 2 — Fetching triples from DBpedia SPARQL endpoint")
+        print(f"  Endpoint: {args.sparql_endpoint}")
         t0 = time.time()
-        triples = targeted_scan(
-            fpath,
+        raw_triples = sparql_fetch(
             anchor_set,
-            background_limit=args.background_limit,
-            scan_limit=args.scan_limit,
+            endpoint=args.sparql_endpoint,
+            per_entity_limit=args.sparql_limit,
         )
-        raw_triples.extend(triples)
-        print(f"  {len(triples):,} triples in {time.time()-t0:.1f}s")
+        print(f"  {len(raw_triples):,} triples fetched in {time.time()-t0:.1f}s")
+    else:
+        for fpath in (args.dbpedia_objects, args.dbpedia_literals):
+            if not Path(fpath).exists():
+                print(f"  [skip] {fpath} not found")
+                continue
+            print(f"\nStep 2 — Scanning {Path(fpath).name}")
+            t0 = time.time()
+            triples = targeted_scan(
+                fpath,
+                anchor_set,
+                background_limit=args.background_limit,
+                scan_limit=args.scan_limit,
+            )
+            raw_triples.extend(triples)
+            print(f"  {len(triples):,} triples in {time.time()-t0:.1f}s")
 
     if not raw_triples:
-        print("ERROR: No triples loaded. Check DBpedia file paths.")
+        print("ERROR: No triples loaded. Check DBpedia file paths or SPARQL endpoint.")
         sys.exit(1)
 
     # deduplicate
