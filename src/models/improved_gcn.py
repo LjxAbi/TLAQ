@@ -16,8 +16,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.sparse import coo_matrix
-import numpy as np
 
 from src.data.tkg_dataset import TKGDataset
 
@@ -31,7 +29,7 @@ def _build_weighted_adjacency(
     device: torch.device,
 ) -> torch.Tensor:
     """
-    Build the weighted adjacency matrix Ã used by the improved GCN.
+    Build the weighted normalised adjacency Ã as a sparse COO tensor.
 
     For each pair (ei, ej) connected by at least one relational triple:
 
@@ -39,20 +37,20 @@ def _build_weighted_adjacency(
         re(ei,ej,tr) = (nodes_i + nodes_j) / nums_r             (Eq 5)
         Aij          = Σ_{<ei,tr,ej>∈RT} da(ei,ej) * re(ei,ej,tr)  (Eq 3)
 
-    The matrix is then symmetrically normalised (D̂^{-1/2} A D̂^{-1/2})
-    following Eq (2), with self-loops added beforehand.
+    The matrix is symmetrically normalised (D̂^{-1/2} A D̂^{-1/2}) with
+    self-loops added beforehand (Eq 2).
 
-    Returns a dense float tensor of shape [N, N].
+    Returns a sparse float tensor of shape [N, N].  Using sparse avoids
+    the O(N²) dense allocation that is impractical for large graphs.
     """
     assert dataset._indices_built, "Call dataset.build_indices() first."
 
     N = dataset.num_entities
-    # accumulate raw weights into a dict to avoid O(N^2) dense allocation
     weight: Dict[Tuple[int, int], float] = defaultdict(float)
 
     for triple in dataset.relation_triples:
         ei, tr, ej = triple.head, triple.relation, triple.tail
-        head_i = max(dataset.head_count[ei], 1)   # avoid /0
+        head_i = max(dataset.head_count[ei], 1)
         tail_j = max(dataset.tail_count[ej], 1)
         nums_r = max(dataset.nums_r[tr], 1)
 
@@ -63,27 +61,28 @@ def _build_weighted_adjacency(
 
         weight[(ei, ej)] += da_val * re_val                         # Eq 3
 
-    # build sparse COO then convert
     rows, cols, vals = [], [], []
     for (i, j), v in weight.items():
         rows.append(i); cols.append(j); vals.append(v)
-
-    # add self-loops (identity part of Â)
-    for i in range(N):
+    for i in range(N):                              # self-loops
         rows.append(i); cols.append(i); vals.append(1.0)
 
-    A_sparse = coo_matrix(
-        (vals, (rows, cols)), shape=(N, N), dtype=np.float32
-    ).toarray()
-    A = torch.tensor(A_sparse, dtype=torch.float32, device=device)  # [N, N]
+    rows_t = torch.tensor(rows, dtype=torch.long)
+    cols_t = torch.tensor(cols, dtype=torch.long)
+    vals_t = torch.tensor(vals, dtype=torch.float32)
 
-    # symmetric normalisation: D̂^{-1/2} A D̂^{-1/2}              (Eq 2)
-    deg = A.sum(dim=1)                                               # [N]
+    # degree from sparse accumulation (no dense N×N matrix)
+    deg = torch.zeros(N, dtype=torch.float32)
+    deg.scatter_add_(0, rows_t, vals_t)
     deg_inv_sqrt = torch.pow(deg.clamp(min=1e-6), -0.5)
-    D_inv_sqrt = torch.diag(deg_inv_sqrt)                            # [N, N]
-    A_hat = D_inv_sqrt @ A @ D_inv_sqrt                             # [N, N]
 
-    return A_hat
+    # symmetric normalisation: scale each entry by d_i^{-½} * d_j^{-½}
+    scaled = vals_t * deg_inv_sqrt[rows_t] * deg_inv_sqrt[cols_t]
+
+    indices = torch.stack([rows_t, cols_t], dim=0)
+    A_hat = torch.sparse_coo_tensor(indices, scaled, (N, N),
+                                     dtype=torch.float32).coalesce()
+    return A_hat.to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -112,10 +111,11 @@ class ImprovedGCNLayer(nn.Module):
     def forward(
         self,
         H: torch.Tensor,       # [N, in_dim]
-        A_hat: torch.Tensor,   # [N, N]  normalised adjacency
+        A_hat: torch.Tensor,   # [N, N]  sparse normalised adjacency
     ) -> torch.Tensor:         # [N, out_dim]
         H = self.dropout(H)
-        neighbour = A_hat @ H                  # aggregate neighbours
+        # sparse × dense matrix multiply — O(nnz · d) not O(N² · d)
+        neighbour = torch.sparse.mm(A_hat, H)  # [N, in_dim]
         out = self.W0(neighbour) + self.W1(H)  # Eq 1 (bias-free)
         return F.relu(out)
 

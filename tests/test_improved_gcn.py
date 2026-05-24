@@ -82,13 +82,13 @@ def test_adjacency_shape(tiny_tkg):
 
 
 def test_adjacency_values_positive(tiny_tkg):
-    A = _build_weighted_adjacency(tiny_tkg, torch.device("cpu"))
+    A = _build_weighted_adjacency(tiny_tkg, torch.device("cpu")).to_dense()
     assert (A >= 0).all(), "All adjacency weights should be non-negative"
 
 
 def test_adjacency_diagonal_nonzero(tiny_tkg):
     """Self-loops must be present (diagonal should be non-zero after normalisation)."""
-    A = _build_weighted_adjacency(tiny_tkg, torch.device("cpu"))
+    A = _build_weighted_adjacency(tiny_tkg, torch.device("cpu")).to_dense()
     assert (A.diag() > 0).all(), "Diagonal (self-loops) should be positive"
 
 
