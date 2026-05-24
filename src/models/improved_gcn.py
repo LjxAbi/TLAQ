@@ -163,10 +163,9 @@ class ImprovedGCN(nn.Module):
         self._A_hat: Optional[torch.Tensor] = None
 
     def _get_adjacency(self) -> torch.Tensor:
-        if self._A_hat is None:
-            self._A_hat = _build_weighted_adjacency(
-                self.dataset, self.device
-            )
+        actual_device = self.entity_emb.weight.device
+        if self._A_hat is None or self._A_hat.device != actual_device:
+            self._A_hat = _build_weighted_adjacency(self.dataset, actual_device)
         return self._A_hat
 
     def invalidate_adjacency(self) -> None:
