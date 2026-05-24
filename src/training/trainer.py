@@ -146,6 +146,7 @@ class TLAQTrainer:
             dataset = self.dataset,
             margin  = cfg.gcn_margin,
             lr      = cfg.gcn_lr,
+            device  = self.device,
         )
         history.gcn_losses = self._fit_with_patience(
             trainer    = gcn_trainer,
@@ -174,6 +175,7 @@ class TLAQTrainer:
                 margin            = cfg.hyte_margin,
                 lr                = cfg.hyte_lr,
                 negative_sampling = cfg.hyte_neg_mode,
+                device            = self.device,
             )
             history.hyte_losses = self._fit_with_patience(
                 trainer    = hyte_trainer,
